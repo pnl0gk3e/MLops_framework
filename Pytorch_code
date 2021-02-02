@@ -1,0 +1,712 @@
+# Databricks notebook source
+
+import pyspark.sql.functions as F
+from torch.utils.data import Dataset, DataLoader
+import torch
+
+
+#Step1: Get the data , vocab for cust and rules and dictionary for content to index
+inp= spark.read.format("parquet").load("/mnt/input-data/HyperPersonalization/XSellModelCheckpoints/relevance_2/")
+unique_user_ids = set([row["cust"] for row in inp.toLocalIterator()])
+unique_rule_ids = set([row["rule_id"] for row in inp.toLocalIterator()])
+
+unique_user_ids_vocab = inp.groupBy(["cust"]).count().count()
+unique_rule_ids_vocab = inp.groupBy(["rule_id"]).count().count()
+
+# items to category dictionary 
+rules_to_ix = {word: i for i, word in enumerate(unique_user_ids)}
+cust_to_ix = {word: i for i, word in enumerate(unique_rule_ids)}
+
+#Step 2: Wrap the data in a datloader class for batch indexing and tensor conversion
+class customDataset(Dataset):
+    def __init__(self, X):
+        self.cust = [row["cust"] for row in X.toLocalIterator()]
+        self.rule = [row["rule_id"] for row in X.toLocalIterator()] 
+        self.relevance = [row["relevance"] for row in X.toLocalIterator()]
+        
+    def __len__(self):
+        return len(self.relevance)
+    
+    def __getitem__(self, idx):
+        return self.cust[idx], self.rule[idx], self.relevance[idx]
+      
+      
+#creating train and valid datasets
+train_ds = customDataset(inp)
+#valid_ds = customDataset(X_val, y_val, emb_cols)
+
+train_loader = DataLoader(dataset=train_ds,batch_size=1000,shuffle=True,num_workers=0)
+
+# COMMAND ----------
+
+import pyspark.sql.functions as F
+#historical size
+transactions = spark.read.format("delta").load("/mnt/input-data/transactions")
+transactions_1 = spark.read.format("delta").load("/mnt/input-data/transactions")
+
+
+transactions_1 = transactions.filter(F.col("TransactionDt") < F.col("TransactionDt").max()).count()
+
+
+# COMMAND ----------
+
+from datetime import datetime, timedelta
+transactions.filter(F.col("TransactionDt") <= datetime.now() - timedelta(days=91)).count() - transactions.filter(F.col("TransactionDt") <= datetime.now() - timedelta(days=92)).count() 
+
+
+
+# COMMAND ----------
+
+transactions.show(10)
+
+# COMMAND ----------
+
+
+#from pyspark.sql.functions import col, size, sum, array_except, approx_count_distinct, count, avg, stddev, skewness
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+
+#Step1: Get the data , vocab for cust and rules and dictionary for content to index
+inp= spark.read.format("parquet").load("/mnt/input-data/HyperPersonalization/XSellModelCheckpoints/relevance_2/")
+unique_cust_ids = set([row["cust"] for row in inp.toLocalIterator()])
+unique_rule_ids = set([row["rule_id"] for row in inp.toLocalIterator()])
+
+unique_cust_ids_vocab = inp.groupBy(["cust"]).count().count()
+unique_rule_ids_vocab = inp.groupBy(["rule_id"]).count().count()
+
+# items to category dictionary 
+rules_to_ix = {word: i for i, word in enumerate(unique_rule_ids)}
+cust_to_ix = {word: i for i, word in enumerate(unique_cust_ids)}
+
+#Step 2: Wrap the data in a datloader class for batch indexing and tensor conversion
+class customDataset(Dataset):
+    def __init__(self, X):
+        self.cust = [row["cust"] for row in X.toLocalIterator()]
+        self.rule = [row["rule_id"] for row in X.toLocalIterator()] 
+        self.relevance = [row["relevance"] for row in X.toLocalIterator()]
+        
+    def __len__(self):
+        return len(self.relevance)
+    
+    def __getitem__(self, idx):
+        return self.cust[idx], self.rule[idx], self.relevance[idx]
+      
+      
+#creating train and valid datasets
+train_ds = customDataset(inp)
+#valid_ds = customDataset(X_val, y_val, emb_cols)
+
+train_loader = DataLoader(dataset=train_ds,batch_size=1000,shuffle=True,num_workers=0)
+      
+sampled = inp.sample(True, 0.01, 42)
+
+validation_ds = customDataset(sampled)
+validate_loader = DataLoader(dataset=validation_ds,batch_size=50000,shuffle=True,num_workers=0)
+      
+
+class Model(nn.Module):
+
+    def __init__(self, cust_count, rule_count,embedding_dim):
+        super(Model, self).__init__()
+        self.rule_embeddings = nn.Embedding(rule_count, embedding_dim)
+        self.cust_embeddings = nn.Embedding(cust_count, embedding_dim)
+        self.linear1 = nn.Linear(embedding_dim, 128)
+        self.linear2 = nn.Linear(embedding_dim, 128)
+
+    def forward(self, custs, rules):
+        cust_embeddings = self.cust_embeddings(custs)
+        rule_embeddings = self.rule_embeddings(rules)
+
+        cust_out = F.relu(self.linear1(cust_embeddings))
+        rule_out = F.relu(self.linear2(rule_embeddings))
+                
+        dot_of_cust_rule = torch.sum(torch.einsum('ab,ab->ab', cust_out , rule_out), dim=-1)
+
+        return  dot_of_cust_rule 
+      
+    def get_vector_representation_custs(self,custs):
+      cust_embeddings = self.cust_embeddings(custs)
+      cust_out = F.relu(self.linear1(cust_embeddings))
+      return cust_out
+    
+    def get_vector_representation_rules(self,rules):
+      rule_embeddings = self.rule_embeddings(rules)
+      rule_out = F.relu(self.linear2(rule_embeddings))
+      return rule_out
+      
+
+
+losses = []
+loss_function = nn.MSELoss()
+model = Model(unique_cust_ids_vocab,unique_rule_ids_vocab, EMBEDDING_DIM)
+optimizer = optim.SGD(model.parameters(), lr=0.001)
+
+for cust_validate, rule_validate, rel_validate in validate_loader:
+    cust_validate_idxs = torch.tensor([cust_to_ix[w.item()] for w in cust_validate], dtype=torch.long)
+    rule_validate_idxs = torch.tensor([rules_to_ix[w.item()] for w in rule_validate], dtype=torch.long)
+    relevance_validate = rel_validate.float()
+
+
+
+#train and store the loss
+for epoch in range(1):
+    total_loss = 0
+    index=0
+    for cust, rule, relevance in train_loader:
+
+        # Step 1. Prepare the inputs to be passed to the model (i.e, turn the words
+        # into integer indices and wrap them in tensors)
+        cust_idxs = torch.tensor([cust_to_ix[w.item()] for w in cust], dtype=torch.long)
+        rule_idxs = torch.tensor([rules_to_ix[w.item()] for w in rule], dtype=torch.long)
+        relevance = relevance.float()
+
+        # Step 2. Recall that torch *accumulates* gradients. Before passing in a
+        # new instance, you need to zero out the gradients from the old
+        # instance
+        model.zero_grad()
+
+        # Step 3. Run the forward pass, getting log probabilities over next
+        # words
+        dot_products = model(cust_idxs,rule_idxs)
+
+        # Step 4. Compute your loss function. (Again, Torch wants the target
+        # word wrapped in a tensor)
+        loss = loss_function(dot_products, relevance)
+        
+        # Step 5. Do the backward pass and update the gradient
+        loss.backward()
+        optimizer.step()
+
+        # Get the Python number from a 1-element Tensor by calling tensor.item()
+        total_loss += loss.item()
+        index += 1
+        
+        # also get the vaidation loss 
+        validation_loss =  loss_function(model( cust_validate_idxs, rule_validate_idxs), relevance_validate)
+        
+        print(loss.item()/1000,index , validation_loss.item()/50000)
+    losses.append(total_loss)
+print(losses)  # The loss decreased every iteration over the training 
+
+
+# COMMAND ----------
+
+sampled = inp.sample(True, 0.01, 42)
+
+validation_ds = customDataset(sampled)
+validate_loader = DataLoader(dataset=validation_ds,batch_size=50000,shuffle=True,num_workers=0)
+      
+
+class Model(nn.Module):
+
+    def __init__(self, cust_count, rule_count,embedding_dim):
+        super(Model, self).__init__()
+        self.rule_embeddings = nn.Embedding(rule_count, embedding_dim)
+        self.cust_embeddings = nn.Embedding(cust_count, embedding_dim)
+        self.linear1 = nn.Linear(embedding_dim, 128)
+        self.linear2 = nn.Linear(embedding_dim, 128)
+
+    def forward(self, custs, rules):
+        cust_embeddings = self.cust_embeddings(custs)
+        rule_embeddings = self.rule_embeddings(rules)
+
+        cust_out = F.relu(self.linear1(cust_embeddings))
+        rule_out = F.relu(self.linear2(rule_embeddings))
+                
+        dot_of_cust_rule = torch.sum(torch.einsum('ab,ab->ab', cust_out , rule_out), dim=-1)
+
+        return  dot_of_cust_rule 
+      
+    def get_vector_representation_custs(self,custs):
+      cust_embeddings = self.cust_embeddings(custs)
+      cust_out = F.relu(self.linear1(cust_embeddings))
+      return cust_out
+    
+    def get_vector_representation_rules(self,rules):
+      rule_embeddings = self.rule_embeddings(rules)
+      rule_out = F.relu(self.linear2(rule_embeddings))
+      return rule_out
+      
+
+
+losses = []
+loss_function = nn.MSELoss()
+model = Model(unique_cust_ids_vocab,unique_rule_ids_vocab, EMBEDDING_DIM)
+optimizer = optim.SGD(model.parameters(), lr=0.001)
+
+for cust_validate, rule_validate, rel_validate in validate_loader:
+    cust_validate_idxs = torch.tensor([cust_to_ix[w.item()] for w in cust_validate], dtype=torch.long)
+    rule_validate_idxs = torch.tensor([rules_to_ix[w.item()] for w in rule_validate], dtype=torch.long)
+    relevance_validate = rel_validate.float()
+
+
+
+#train and store the loss
+for epoch in range(1):
+    total_loss = 0
+    index=0
+    for cust, rule, relevance in train_loader:
+
+        # Step 1. Prepare the inputs to be passed to the model (i.e, turn the words
+        # into integer indices and wrap them in tensors)
+        cust_idxs = torch.tensor([cust_to_ix[w.item()] for w in cust], dtype=torch.long)
+        rule_idxs = torch.tensor([rules_to_ix[w.item()] for w in rule], dtype=torch.long)
+        relevance = relevance.float()
+
+        # Step 2. Recall that torch *accumulates* gradients. Before passing in a
+        # new instance, you need to zero out the gradients from the old
+        # instance
+        model.zero_grad()
+
+        # Step 3. Run the forward pass, getting log probabilities over next
+        # words
+        dot_products = model(cust_idxs,rule_idxs)
+
+        # Step 4. Compute your loss function. (Again, Torch wants the target
+        # word wrapped in a tensor)
+        loss = loss_function(dot_products, relevance)
+        
+        # Step 5. Do the backward pass and update the gradient
+        loss.backward()
+        optimizer.step()
+
+        # Get the Python number from a 1-element Tensor by calling tensor.item()
+        total_loss += loss.item()
+        index += 1
+        
+        # also get the vaidation loss 
+        validation_loss =  loss_function(model( cust_validate_idxs, rule_validate_idxs), relevance_validate)
+        
+        print(loss.item()/1000,index , validation_loss.item()/50000)
+    losses.append(total_loss)
+print(losses)  # The loss decreased every iteration over the training 
+
+# COMMAND ----------
+
+# get the vectors
+# create the list of 50,000 customers and all rule
+cust_vectors_tmp = list(unique_cust_ids)[0:1000] 
+rule_vectors_tmp =  list(unique_rule_ids)
+cust_vectors_word = torch.tensor([cust_to_ix[w.item()] for w in cust], dtype=torch.long)
+rule_vectors_word = torch.tensor([rules_to_ix[w.item()] for w in rule], dtype=torch.long)
+cust_vectors = model.get_vector_representation_custs(cust_vectors_word)
+rule_vectors = model.get_vector_representation_rules(rule_vectors_word)
+result_matrix = torch.einsum('ac,bc ->ab',cust_vectors , rule_vectors)
+
+# COMMAND ----------
+
+import pandas as pd
+import numpy as np
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+import seaborn as sns
+cust_vectors_value = cust_vectors.detach().numpy()
+X_embedded = TSNE(n_components=2).fit_transform(cust_vectors_value)
+df_tsne = pd.DataFrame(X_embedded, columns = ["X",'Y'])
+sns.scatterplot(data=df_tsne, x="X", y="Y")
+
+# COMMAND ----------
+
+result_matrix[1].topk(10)
+
+# COMMAND ----------
+
+inp.show()
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col
+sampled = inp.sample(True, 0.01, 42)
+sampled.count()
+
+
+# COMMAND ----------
+
+df = inp.toPandas()
+
+# COMMAND ----------
+
+df.groupby(["relevance"]).agg({"ant_count":"count"}).reset_index().sort_values(["ant_count"], ascending =False)
+
+# COMMAND ----------
+
+# Test the envionment
+!nvidia-smi -L
+!git clone https://github.com/openai/CLIP.git
+!pip install ftfy 
+
+
+# COMMAND ----------
+
+import torch
+import clip
+from PIL import Image
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model, preprocess = clip.load("ViT-B/32", device=device)
+
+image = preprocess(Image.open("CLIP.png")).unsqueeze(0).to(device)
+text = clip.tokenize(["a diagram", "a dog", "a cat"]).to(device)
+
+with torch.no_grad():
+    image_features = model.encode_image(image)
+    text_features = model.encode_text(text)
+    
+    logits_per_image, logits_per_text = model(image, text)
+    probs = logits_per_image.softmax(dim=-1).cpu().numpy()
+
+print("Label probs:", probs)  # prints: [[0.9927937  0.00421068 0.00299572]]
+
+# COMMAND ----------
+
+import numpy as np
+import torch
+
+print("Torch version:", torch.__version__)
+
+# COMMAND ----------
+
+MODELS = {
+    "ViT-B/32":       "https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt",
+}
+! wget {MODELS["ViT-B/32"]} -O model.pt
+
+# COMMAND ----------
+
+model = torch.jit.load("model.pt").cuda().eval()
+input_resolution = model.input_resolution.item()
+context_length = model.context_length.item()
+vocab_size = model.vocab_size.item()
+
+print("Model parameters:", f"{np.sum([int(np.prod(p.shape)) for p in model.parameters()]):,}")
+print("Input resolution:", input_resolution)
+print("Context length:", context_length)
+print("Vocab size:", vocab_size)
+
+# COMMAND ----------
+
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
+
+preprocess = Compose([
+    Resize(input_resolution, interpolation=Image.BICUBIC),
+    CenterCrop(input_resolution),
+    ToTensor()
+])
+
+image_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda()
+image_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda()
+
+# COMMAND ----------
+
+MODELS = {
+    "ViT-B/32":       "https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt",
+}
+! wget {MODELS["ViT-B/32"]} -O model.pt
+! pip install ftfy regex
+! wget https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.txt.gz -O bpe_simple_vocab_16e6.txt.gz
+
+# COMMAND ----------
+
+# so we ahve a list of images and a list of labels, now feature building for zero shot ranking
+#from torchvision.datasets import CIFAR100
+#cifar100 = CIFAR100(os.path.expanduser("~/.cache"), transform=preprocess, download=True)
+MODELS = {
+    "ViT-B/32":       "https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt",
+}
+! wget {MODELS["ViT-B/32"]} -O model.pt
+! pip install ftfy regex
+! wget https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.txt.gz -O bpe_simple_vocab_16e6.txt.gz
+
+# COMMAND ----------
+
+#@title
+
+import gzip
+import html
+import os
+from functools import lru_cache
+
+import ftfy
+import regex as re
+
+
+@lru_cache()
+def bytes_to_unicode():
+    """
+    Returns list of utf-8 byte and a corresponding list of unicode strings.
+    The reversible bpe codes work on unicode strings.
+    This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
+    When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
+    This is a signficant percentage of your normal, say, 32K bpe vocab.
+    To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
+    And avoids mapping to whitespace/control characters the bpe code barfs on.
+    """
+    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8+n)
+            n += 1
+    cs = [chr(n) for n in cs]
+    return dict(zip(bs, cs))
+
+
+def get_pairs(word):
+    """Return set of symbol pairs in a word.
+    Word is represented as tuple of symbols (symbols being variable-length strings).
+    """
+    pairs = set()
+    prev_char = word[0]
+    for char in word[1:]:
+        pairs.add((prev_char, char))
+        prev_char = char
+    return pairs
+
+
+def basic_clean(text):
+    text = ftfy.fix_text(text)
+    text = html.unescape(html.unescape(text))
+    return text.strip()
+
+
+def whitespace_clean(text):
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    return text
+
+
+class SimpleTokenizer(object):
+    def __init__(self, bpe_path: str = "bpe_simple_vocab_16e6.txt.gz"):
+        self.byte_encoder = bytes_to_unicode()
+        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
+        merges = gzip.open(bpe_path).read().decode("utf-8").split('\n')
+        merges = merges[1:49152-256-2+1]
+        merges = [tuple(merge.split()) for merge in merges]
+        vocab = list(bytes_to_unicode().values())
+        vocab = vocab + [v+'</w>' for v in vocab]
+        for merge in merges:
+            vocab.append(''.join(merge))
+        vocab.extend(['<|startoftext|>', '<|endoftext|>'])
+        self.encoder = dict(zip(vocab, range(len(vocab))))
+        self.decoder = {v: k for k, v in self.encoder.items()}
+        self.bpe_ranks = dict(zip(merges, range(len(merges))))
+        self.cache = {'<|startoftext|>': '<|startoftext|>', '<|endoftext|>': '<|endoftext|>'}
+        self.pat = re.compile(r"""<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+""", re.IGNORECASE)
+
+    def bpe(self, token):
+        if token in self.cache:
+            return self.cache[token]
+        word = tuple(token[:-1]) + ( token[-1] + '</w>',)
+        pairs = get_pairs(word)
+
+        if not pairs:
+            return token+'</w>'
+
+        while True:
+            bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float('inf')))
+            if bigram not in self.bpe_ranks:
+                break
+            first, second = bigram
+            new_word = []
+            i = 0
+            while i < len(word):
+                try:
+                    j = word.index(first, i)
+                    new_word.extend(word[i:j])
+                    i = j
+                except:
+                    new_word.extend(word[i:])
+                    break
+
+                if word[i] == first and i < len(word)-1 and word[i+1] == second:
+                    new_word.append(first+second)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            new_word = tuple(new_word)
+            word = new_word
+            if len(word) == 1:
+                break
+            else:
+                pairs = get_pairs(word)
+        word = ' '.join(word)
+        self.cache[token] = word
+        return word
+
+    def encode(self, text):
+        bpe_tokens = []
+        text = whitespace_clean(basic_clean(text)).lower()
+        for token in re.findall(self.pat, text):
+            token = ''.join(self.byte_encoder[b] for b in token.encode('utf-8'))
+            bpe_tokens.extend(self.encoder[bpe_token] for bpe_token in self.bpe(token).split(' '))
+        return bpe_tokens
+
+    def decode(self, tokens):
+        text = ''.join([self.decoder[token] for token in tokens])
+        text = bytearray([self.byte_decoder[c] for c in text]).decode('utf-8', errors="replace").replace('</w>', ' ')
+        return text
+
+
+# COMMAND ----------
+
+import numpy as np
+import torch
+from torchvision.datasets import CIFAR100
+import torchvision
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
+import IPython.display
+import matplotlib.pyplot as plt
+#calling the model
+model = torch.jit.load("model.pt").cuda().eval()
+input_resolution = model.input_resolution.item()
+context_length = model.context_length.item()
+vocab_size = model.vocab_size.item()
+
+print("Model parameters:", f"{np.sum([int(np.prod(p.shape)) for p in model.parameters()]):,}")
+print("Input resolution:", input_resolution)
+print("Context length:", context_length)
+print("Vocab size:", vocab_size)
+
+# image preprocessing and printing
+
+image_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda()
+image_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda()
+preprocess = Compose([
+    Resize(input_resolution, interpolation=Image.BICUBIC),
+    CenterCrop(input_resolution),
+    ToTensor(),
+    Normalize(mean=image_mean,std=image_std)
+])
+
+'''
+#image procssing for cifar100
+#cifar100 = CIFAR100(os.path.expanduser("~/.cache"), transform=preprocess, download=True
+trainset = torchvision.datasets.CIFAR100(root='./dataroot',
+                                         train=True,
+                                         download=True,
+                                         transform=preprocess)
+trainloader = torch.utils.data.DataLoader(
+    trainset, batch_size=1000, shuffle=True, num_workers=4)
+ '''  
+#image procssing for scimage
+'''
+images = []
+data_dir= "/dbfs/FileStore/shared_uploads/pnl0gk3e@emea.royalahold.net/"
+#images = []
+for filename in [filename for filename in os.listdir(data_dir) if filename.endswith(".png") or filename.endswith(".jpg")]:
+    image = preprocess(Image.open(os.path.join(data_dir, filename)).convert("RGB"))
+    images.append(image)
+image_input = torch.tensor(np.stack(images)).cuda()
+image_input -= image_mean[:, None, None]
+image_input /= image_std[:, None, None]
+'''
+# text preprrocessing - needs the tokenizer class to defined
+tokenizer = SimpleTokenizer()
+sot_token = tokenizer.encoder['<|startoftext|>']
+eot_token = tokenizer.encoder['<|endoftext|>']
+#this is a photo of . this looks like , looks like , definitely , green apples , lemons, non red apples , red apples
+product_list= ["looks like blueberries", "looks like lemon" ,"looks like red apple","looks like green apple"]
+#text_descriptions = [f"This is a photo of a {label}" for label in product_list]
+text_descriptions = product_list
+text_tokens = [[sot_token] + tokenizer.encode(desc) + [eot_token] for desc in text_descriptions]
+text_input = torch.zeros(len(text_tokens), model.context_length, dtype=torch.long)
+
+for i, tokens in enumerate(text_tokens):
+    text_input[i, :len(tokens)] = torch.tensor(tokens)
+
+text_input = text_input.cuda()
+text_input.shape
+
+# COMMAND ----------
+
+len(images)
+
+# COMMAND ----------
+
+#to read and plot the images from scimage
+
+with torch.no_grad():
+  image_features = model.encode_image(image_input).float()
+  image_features /= image_features.norm(dim=-1, keepdim=True)
+  text_features = model.encode_text(text_input).float()
+  text_features /= text_features.norm(dim=-1, keepdim=True)
+
+similarity = text_features.cpu().numpy() @ image_features.cpu().numpy().T
+
+# COMMAND ----------
+
+import pandas as pd
+df= pd.DataFrame(similarity).T
+df = df.rename(columns = {0:"label",1:"non-label"})
+df["diff"] = np.where(df["label"]-df["non-label"] >0 ,1,0)
+df= df[df["diff"]>0].sort_values(["label"], ascending= False)
+df.head(5)
+
+# COMMAND ----------
+
+ plt.imshow(images[331].permute(1, 2, 0))
+
+# COMMAND ----------
+
+image_features.shape
+
+# COMMAND ----------
+
+text_features.shape
+
+# COMMAND ----------
+
+# get the fruit data sets
+!git clone git@github.com:Horea94/Fruit-Images-Dataset.git
+  
+
+# COMMAND ----------
+
+import numpy as np
+import torch
+import torchvision
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
+#import skimage
+import IPython.display
+import matplotlib.pyplot as plt
+import os
+
+# image preprocessing and printing
+
+image_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda()
+image_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda()
+input_resolution = 224
+preprocess = Compose([
+    Resize(input_resolution, interpolation=Image.BICUBIC),
+    CenterCrop(input_resolution),
+    ToTensor(),
+    Normalize(mean=image_mean,std=image_std)
+])
+
+#image procssing for scimage
+data_dir= "/dbfs/FileStore/shared_uploads/pnl0gk3e@emea.royalahold.net/"
+images = []
+for filename in [filename for filename in os.listdir(data_dir) if filename.endswith(".png") or filename.endswith(".jpg")]:
+    image = preprocess(Image.open(os.path.join(data_dir, filename)).convert("RGB"))
+    images.append(image)
+image_input = torch.tensor(np.stack(images)).cuda()
+image_input -= image_mean[:, None, None]
+image_input /= image_std[:, None, None]
+
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
